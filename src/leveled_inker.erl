@@ -95,8 +95,8 @@
         code_change/3,
         ink_start/1,
         ink_snapstart/1,
-        ink_put/4,
-        ink_mput/3,
+        ink_put/6,
+        ink_mput/4,
         ink_get/3,
         ink_fetch/3,
         ink_keycheck/3,
@@ -197,7 +197,8 @@ ink_snapstart(InkerOpts) ->
 -spec ink_put(pid(),
                 leveled_codec:ledger_key(),
                 any(),
-                leveled_codec:journal_keychanges()) ->
+                leveled_codec:journal_keychanges(),
+                leveled_codec:compression_method(), boolean()) ->
                                    {ok, integer(), integer()}.
 %% @doc
 %% PUT an object into the journal, returning the sequence number for the PUT
@@ -205,18 +206,33 @@ ink_snapstart(InkerOpts) ->
 %%
 %% KeyChanges is a tuple of {KeyChanges, TTL} where the TTL is an
 %% expiry time (or infinity).
-ink_put(Pid, PrimaryKey, Object, KeyChanges) ->
-    gen_server:call(Pid, {put, PrimaryKey, Object, KeyChanges}, infinity).
+ink_put(Pid, PrimaryKey, Object, KeyChanges, PressMethod, Compress) ->
+    JournalTag = leveled_codec:check_forinkertype(PrimaryKey, Object),
+    JournalValue =
+        leveled_codec:create_value_for_journal({Object, KeyChanges},
+                                                Compress,
+                                                PressMethod),
+    gen_server:call(Pid,
+                        {put, PrimaryKey, JournalTag, JournalValue},
+                        infinity).
 
 
--spec ink_mput(pid(), any(), {list(), integer()|infinity}) -> {ok, integer()}.
+-spec ink_mput(pid(),
+                {list(), integer()|infinity},
+                leveled_codec:compression_method(),
+                boolean())
+                    -> {ok, integer()}.
 %% @doc
 %% MPUT as series of object specifications, which will be converted into 
 %% objects in the Ledger.  This should only be used when the Bookie is 
-%% running in head_only mode.  The journal entries arekept only for handling
+%% running in head_only mode.  The journal entries are kept only for handling
 %% consistency on startup
-ink_mput(Pid, PrimaryKey, ObjectChanges) ->
-    gen_server:call(Pid, {mput, PrimaryKey, ObjectChanges}, infinity).
+ink_mput(Pid, ObjectChanges, PressMethod, Compress) ->
+    JournalValue =
+        leveled_codec:create_value_for_journal({head_only, ObjectChanges},
+                                                Compress,
+                                                PressMethod),
+    gen_server:call(Pid, {mput, JournalValue}, infinity).
 
 -spec ink_get(pid(),
                 leveled_codec:ledger_key(),
@@ -491,15 +507,15 @@ init([LogOpts, InkerOpts]) ->
     end.
 
 
-handle_call({put, Key, Object, KeyChanges}, _From,
+handle_call({put, Key, JournalTag, Value}, _From,
                 State=#state{is_snapshot=Snap}) when Snap == false ->
-    case put_object(Key, Object, KeyChanges, State) of
+    case put_object(Key, JournalTag, Value, State) of
         {_, UpdState, ObjSize} ->
             {reply, {ok, UpdState#state.journal_sqn, ObjSize}, UpdState}
     end;
-handle_call({mput, Key, ObjChanges}, _From,
+handle_call({mput, Value}, _From,
                 State=#state{is_snapshot=Snap}) when Snap == false ->
-    case put_object(Key, head_only, ObjChanges, State) of
+    case put_object(dummy, ?INKT_MPUT, Value, State) of
         {_, UpdState, _ObjSize} ->
             {reply, {ok, UpdState#state.journal_sqn}, UpdState}
     end;
@@ -887,30 +903,22 @@ get_cdbopts(InkOpts)->
     CDBopts#cdb_options{waste_path = WasteFP}.
 
 
--spec put_object(leveled_codec:ledger_key(), 
-                    any(), 
-                    leveled_codec:journal_keychanges(), 
+-spec put_object(leveled_codec:ledger_key()|dummy, 
+                    leveled_codec:journal_key_tag(), 
+                    binary(), 
                     ink_state()) 
-                                    -> {ok|rolling, ink_state(), integer()}.
+                        -> {ok|rolling, ink_state(), integer()}.
 %% @doc
 %% Add the object to the current journal if it fits.  If it doesn't fit, a new 
 %% journal must be started, and the old journal is set to "roll" into a read
 %% only Journal. 
 %% The reply contains the byte_size of the object, using the size calculated
 %% to store the object.
-put_object(LedgerKey, Object, KeyChanges, State) ->
+put_object(LedgerKey, JournalTag, JournalBin, State) ->
     NewSQN = State#state.journal_sqn + 1,
     ActiveJournal = State#state.active_journaldb,
-    {JournalKey, JournalBin} = 
-        leveled_codec:to_inkerkv(LedgerKey,
-                                    NewSQN,
-                                    Object,
-                                    KeyChanges,
-                                    State#state.compression_method,
-                                    State#state.compress_on_receipt),
-    case leveled_cdb:cdb_put(ActiveJournal,
-                                JournalKey,
-                                JournalBin) of
+    JournalKey = leveled_codec:to_inkerkey(LedgerKey, NewSQN, JournalTag),
+    case leveled_cdb:cdb_put(ActiveJournal, JournalKey, JournalBin) of
         ok ->
             {ok,
                 State#state{journal_sqn=NewSQN},
@@ -1407,10 +1415,12 @@ compact_journal_testto(WRP, ExpectedFiles) ->
     build_dummy_journal(fun test_ledgerkey/1),
     {ok, Ink1} = ink_start(InkOpts),
     
-    {ok, NewSQN1, _ObjSize} = ink_put(Ink1,
-                                        test_ledgerkey("KeyAA"),
-                                        "TestValueAA",
-                                        {[], infinity}),
+    {ok, NewSQN1, _ObjSize} =
+        ink_put(Ink1,
+                test_ledgerkey("KeyAA"),
+                "TestValueAA",
+                {[], infinity},
+                native, true),
     ?assertMatch(NewSQN1, 5),
     ok = ink_printmanifest(Ink1),
     R0 = ink_get(Ink1, test_ledgerkey("KeyAA"), 5),
@@ -1423,14 +1433,17 @@ compact_journal_testto(WRP, ExpectedFiles) ->
                             {ok, SQN, _} = ink_put(Ink1,
                                                     test_ledgerkey(PK),
                                                     leveled_rand:rand_bytes(10000),
-                                                    {[], infinity}),
+                                                    {[], infinity},
+                                                    native, true),
                             {SQN, test_ledgerkey(PK)}
                             end,
                         FunnyLoop),
-    {ok, NewSQN2, _ObjSize} = ink_put(Ink1,
-                                        test_ledgerkey("KeyBB"),
-                                        "TestValueBB",
-                                        {[], infinity}),
+    {ok, NewSQN2, _ObjSize} =
+        ink_put(Ink1, 
+                    test_ledgerkey("KeyBB"),
+                    "TestValueBB",
+                    {[], infinity},
+                    lz4, true),
     ?assertMatch(NewSQN2, 54),
     ActualManifest = ink_getmanifest(Ink1),
     ok = ink_printmanifest(Ink1),
@@ -1509,7 +1522,11 @@ empty_manifest_test() ->
                                             compress_on_receipt=false}),
     ?assertMatch(not_present, ink_fetch(Ink2, key_converter("Key1"), 1)),
     {ok, SQN, Size} = 
-        ink_put(Ink2, key_converter("Key1"), "Value1", {[], infinity}),
+        ink_put(Ink2,
+                key_converter("Key1"),
+                "Value1",
+                {[], infinity},
+                lz4, true),
     ?assertMatch(1, SQN), % This is the first key - so should have SQN of 1
     ?assertMatch(true, Size > 0),
     {ok, V} = ink_fetch(Ink2, key_converter("Key1"), 1),

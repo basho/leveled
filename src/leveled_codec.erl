@@ -30,6 +30,7 @@
         from_ledgerkey/2,
         isvalid_ledgerkey/1,
         to_inkerkey/2,
+        to_inkerkey/3,
         to_inkerkv/6,
         from_inkerkv/1,
         from_inkerkv/2,
@@ -395,20 +396,30 @@ get_tagstrategy(Tag, Strategy) ->
 
 -spec to_inkerkey(ledger_key(), non_neg_integer()) -> journal_key().
 %% @doc
-%% convertion from ledger_key to journal_key to allow for the key to be fetched
+%% Conversion from ledger_key to journal_key to allow for the key to be fetched
 to_inkerkey(LedgerKey, SQN) ->
-    {SQN, ?INKT_STND, LedgerKey}.
+    to_inkerkey(LedgerKey, SQN, ?INKT_STND).
+
+-spec to_inkerkey(ledger_key()|dummy, non_neg_integer(), journal_key_tag())
+            -> journal_key().
+%% @doc
+%% Conversion from ledger_key to journal_key
+to_inkerkey(LedgerKey, SQN, Tag) ->
+    {SQN, Tag, LedgerKey}.
 
 
 -spec to_inkerkv(ledger_key(), non_neg_integer(), any(), journal_keychanges(), 
-                    compression_method(), boolean()) -> {journal_key(), any()}.
+                    compression_method(), boolean()) ->
+                        {journal_key(), binary()}.
 %% @doc
 %% Convert to the correct format of a Journal key and value
 to_inkerkv(LedgerKey, SQN, Object, KeyChanges, PressMethod, Compress) ->
-    InkerType = check_forinkertype(LedgerKey, Object),
+    InkerKey =
+        to_inkerkey(LedgerKey, SQN, check_forinkertype(LedgerKey, Object)),
     Value = 
         create_value_for_journal({Object, KeyChanges}, Compress, PressMethod),
-    {{SQN, InkerType, LedgerKey}, Value}.
+    {InkerKey, Value}.
+
 
 -spec revert_to_keydeltas(journal_key(), any()) -> {journal_key(), any()}.
 %% @doc

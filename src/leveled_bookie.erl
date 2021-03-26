@@ -173,6 +173,10 @@
                 head_only = false :: boolean(),
                 head_lookup = true :: boolean(),
 
+                compression_method = ?COMPRESSION_METHOD
+                    :: leveled_codec:compression_method(),
+                compression_onreceipt = true :: boolean(),
+
                 ink_checking = ?MAX_KEYCHECK_FREQUENCY :: integer(),
 
                 put_countdown = 0 :: integer(),
@@ -626,7 +630,7 @@ book_sqn(Pid, Bucket, Key) ->
 book_sqn(Pid, Bucket, Key, Tag) ->
     gen_server:call(Pid, {head, Bucket, Key, Tag, true}, infinity).
 
--spec book_returnfolder(pid(), tuple()) -> {async, fun()}.
+-spec book_returnfolder(pid(), tuple()) -> {async, fun(() -> any())}.
 
 %% @doc Folds over store - deprecated
 %% The tuple() is a query, and book_returnfolder will return an {async, Folder}
@@ -698,7 +702,7 @@ book_returnfolder(Pid, RunnerType) ->
                      FoldAccT :: {FoldFun, Acc},
                      Range :: {IndexField, Start, End},
                      TermHandling :: {ReturnTerms, TermRegex}) ->
-                            {async, Runner::fun()}
+                            {async, Runner::fun(() -> any())}
                                 when Bucket::term(),
                                      StartKey::term(),
                                      FoldFun::fun((Bucket, Key | {IndexVal, Key}, Acc) -> Acc),
@@ -1108,7 +1112,7 @@ book_destroy(Pid) ->
     gen_server:call(Pid, destroy, infinity).
 
 
--spec book_hotbackup(pid()) -> {async, fun()}.
+-spec book_hotbackup(pid()) -> {async, fun(() -> any())}.
 %% @doc Backup the Bookie
 %% Return a function that will take a backup of a snapshot of the Journal.
 %% The function will be 1-arity, and can be passed the absolute folder name
@@ -1230,10 +1234,14 @@ init([Opts]) ->
             PencillerOpts0 =
                 PencillerOpts#penciller_options{sst_options = SSTOpts0},
             
+            {CompressionMethod, CompressOnReceipt} = get_compressionoptions(Opts),
+
             State0 = #state{cache_size=CacheSize,
                                 is_snapshot=false,
                                 head_only=HeadOnly,
-                                head_lookup = HeadLookup},
+                                head_lookup = HeadLookup,
+                                compression_method = CompressionMethod,
+                                compression_onreceipt = CompressOnReceipt},
 
             {Inker, Penciller} = 
                 startup(InkerOpts, PencillerOpts0, State0),
@@ -1260,7 +1268,9 @@ handle_call({put, Bucket, Key, Object, IndexSpecs, Tag, TTL}, From, State)
     {ok, SQN, ObjSize} = leveled_inker:ink_put(State#state.inker,
                                                LedgerKey,
                                                Object,
-                                               {IndexSpecs, TTL}),
+                                               {IndexSpecs, TTL},
+                                               State#state.compression_method,
+                                               State#state.compression_onreceipt),
     {SW1, Timings1} = 
         update_timings(SW0, {put, {inker, ObjSize}}, State#state.put_timings),
     Changes = preparefor_ledgercache(null,
@@ -1301,7 +1311,10 @@ handle_call({put, Bucket, Key, Object, IndexSpecs, Tag, TTL}, From, State)
 handle_call({mput, ObjectSpecs, TTL}, From, State) 
                                         when State#state.head_only == true ->
     {ok, SQN} = 
-        leveled_inker:ink_mput(State#state.inker, dummy, {ObjectSpecs, TTL}),
+        leveled_inker:ink_mput(State#state.inker,
+                                {ObjectSpecs, TTL},
+                                State#state.compression_method,
+                                State#state.compression_onreceipt),
     Changes = 
         preparefor_ledgercache(?INKT_MPUT, ?DUMMY, 
                                 SQN, null, length(ObjectSpecs), 
@@ -1749,17 +1762,7 @@ set_options(Opts) ->
     true = 100.0 >= MRL_CompPerc,
     true = SFL_CompPerc >= 0.0,
 
-    CompressionMethod = proplists:get_value(compression_method, Opts),
-    CompressOnReceipt = 
-        case proplists:get_value(compression_point, Opts) of 
-            on_receipt ->
-                % Note this will add measurable delay to PUT time
-                % https://github.com/martinsumner/leveled/issues/95
-                true;
-            on_compact ->
-                % If using lz4 this is not recommended
-                false 
-        end,
+    {CompressionMethod, CompressOnReceipt} = get_compressionoptions(Opts),
     
     MaxSSTSlots = proplists:get_value(max_sstslots, Opts),
 
@@ -1792,10 +1795,27 @@ set_options(Opts) ->
                                             max_sstslots=MaxSSTSlots}}
         }.
 
+-spec get_compressionoptions(open_options()) ->
+                                {leveled_codec:compression_method(),
+                                    boolean()}.
+get_compressionoptions(Opts) ->
+    CompressionMethod = proplists:get_value(compression_method, Opts),
+    CompressOnReceipt = 
+        case proplists:get_value(compression_point, Opts) of 
+            on_receipt ->
+                % Note this will add measurable delay to PUT time
+                % https://github.com/martinsumner/leveled/issues/95
+                true;
+            on_compact ->
+                % If using lz4 this is not recommended
+                false 
+        end,
+    {CompressionMethod, CompressOnReceipt}.
 
 -spec return_snapfun(book_state(), store|ledger, 
                         tuple()|no_lookup|undefined, 
-                        boolean(), boolean()) -> fun().
+                        boolean(), boolean())
+                            -> fun(() -> {ok, pid(), pid()|null}).
 %% @doc
 %% Generates a function from which a snapshot can be created.  The primary
 %% factor here is the SnapPreFold boolean.  If this is true then the snapshot
@@ -1832,7 +1852,7 @@ snaptype_by_presence(true) ->
 snaptype_by_presence(false) -> 
     ledger.
 
--spec get_runner(book_state(), tuple()) -> {async, fun()}.
+-spec get_runner(book_state(), tuple()) -> {async, fun(() -> any())}.
 %% @doc
 %% Get an {async, Runner} for a given fold type.  Fold types have different 
 %% tuple inputs
@@ -1959,7 +1979,7 @@ get_runner(State, DeprecatedQuery) ->
     get_deprecatedrunner(State, DeprecatedQuery).
 
 
--spec get_deprecatedrunner(book_state(), tuple()) -> {async, fun()}.
+-spec get_deprecatedrunner(book_state(), tuple()) -> {async, fun(() -> any())}.
 %% @doc
 %% Get an {async, Runner} for a given fold type.  Fold types have different 
 %% tuple inputs.  These folds are currently used in tests, but are deprecated.
