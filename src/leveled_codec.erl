@@ -38,7 +38,7 @@
         revert_to_keydeltas/2,
         is_full_journalentry/1,
         split_inkvalue/1,
-        check_forinkertype/2,
+        check_forinkertype/1,
         get_tagstrategy/2,
         maybe_compress/2,
         create_value_for_journal/3,
@@ -415,7 +415,7 @@ to_inkerkey(LedgerKey, SQN, Tag) ->
 %% Convert to the correct format of a Journal key and value
 to_inkerkv(LedgerKey, SQN, Object, KeyChanges, PressMethod, Compress) ->
     InkerKey =
-        to_inkerkey(LedgerKey, SQN, check_forinkertype(LedgerKey, Object)),
+        to_inkerkey(LedgerKey, SQN, check_forinkertype(Object)),
     Value = 
         create_value_for_journal({Object, KeyChanges}, Compress, PressMethod),
     {InkerKey, Value}.
@@ -570,11 +570,11 @@ from_journalkey({SQN, _Type, LedgerKey}) ->
 split_inkvalue(VBin) when is_binary(VBin) ->
     revert_value_from_journal(VBin).
 
-check_forinkertype(_LedgerKey, delete) ->
+check_forinkertype(delete) ->
     ?INKT_TOMB;
-check_forinkertype(_LedgerKey, head_only) ->
+check_forinkertype(head_only) ->
     ?INKT_MPUT;
-check_forinkertype(_LedgerKey, _Object) ->
+check_forinkertype(_Object) ->
     ?INKT_STND.
 
 -spec is_full_journalentry(journal_key()) -> boolean().

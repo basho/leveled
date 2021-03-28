@@ -207,7 +207,7 @@ ink_snapstart(InkerOpts) ->
 %% KeyChanges is a tuple of {KeyChanges, TTL} where the TTL is an
 %% expiry time (or infinity).
 ink_put(Pid, PrimaryKey, Object, KeyChanges, PressMethod, Compress) ->
-    JournalTag = leveled_codec:check_forinkertype(PrimaryKey, Object),
+    JournalTag = leveled_codec:check_forinkertype(Object),
     JournalValue =
         leveled_codec:create_value_for_journal({Object, KeyChanges},
                                                 Compress,
@@ -237,24 +237,32 @@ ink_mput(Pid, ObjectChanges, PressMethod, Compress) ->
 -spec ink_get(pid(),
                 leveled_codec:ledger_key(),
                 integer()) ->
-                         {{integer(), any()}, {any(), any()}}.
+                        {{integer(), any()}, {any(), any()}}.
 %% @doc
 %% Fetch the object as stored in the Journal.  Will not mask errors, should be
 %% used only in tests
 ink_get(Pid, PrimaryKey, SQN) ->
-    gen_server:call(Pid, {get, PrimaryKey, SQN}, infinity).
+    Obj = gen_server:call(Pid, {get, PrimaryKey, SQN}, infinity),
+    leveled_codec:from_inkerkv(Obj, false).
 
 -spec ink_fetch(pid(),
                 {atom(), any(), any(), any()}|string(),
                 integer()) ->
-                         any().
+                        {ok, any()}|not_present.
 %% @doc
 %% Fetch the value that was stored for a given Key at a particular SQN (i.e.
 %% this must be a SQN of the write for this key).  the full object is returned
-%% or the atome not_present if there is no such Key stored at that SQN, or if
+%% or the atom not_present if there is no such Key stored at that SQN, or if
 %% fetching the Key prompted some anticipated error (e.g. CRC check failed)
 ink_fetch(Pid, PrimaryKey, SQN) ->
-    gen_server:call(Pid, {fetch, PrimaryKey, SQN}, infinity).
+    Obj = gen_server:call(Pid, {get, PrimaryKey, SQN}, infinity),
+    case leveled_codec:from_inkerkv(Obj, true) of
+        {{SQN, PrimaryKey}, {Value, _IndexSpecs}} ->
+            {ok, Value};
+        Other ->
+            leveled_log:log("I0001", [PrimaryKey, SQN, Other]),
+            not_present
+    end.
 
 -spec ink_keycheck(pid(), 
                     leveled_codec:ledger_key(),
@@ -515,17 +523,12 @@ handle_call({put, Key, JournalTag, Value}, _From,
     end;
 handle_call({mput, Value}, _From,
                 State=#state{is_snapshot=Snap}) when Snap == false ->
-    case put_object(dummy, ?INKT_MPUT, Value, State) of
+    case put_object(dummy,
+                    leveled_codec:check_forinkertype(head_only),
+                    Value,
+                    State) of
         {_, UpdState, _ObjSize} ->
             {reply, {ok, UpdState#state.journal_sqn}, UpdState}
-    end;
-handle_call({fetch, Key, SQN}, _From, State) ->
-    case get_object(Key, SQN, State#state.manifest, true) of
-        {{SQN, Key}, {Value, _IndexSpecs}} ->
-            {reply, {ok, Value}, State};
-        Other ->
-            leveled_log:log("I0001", [Key, SQN, Other]),
-            {reply, not_present, State}
     end;
 handle_call({get, Key, SQN}, _From, State) ->
     {reply, get_object(Key, SQN, State#state.manifest), State};
@@ -950,17 +953,11 @@ put_object(LedgerKey, JournalTag, JournalBin, State) ->
                     leveled_imanifest:manifest()) -> any().
 %% @doc
 %% Find the SQN in the manifest and then fetch the object from the Journal, 
-%% in the manifest.  If the fetch is in response to a user GET request then
-%% the KeyChanges are irrelevant, so no need to process them.  In this case
-%% the KeyChanges are processed (as ToIgnoreKeyChanges will be set to false).
+%% in the manifest.
 get_object(LedgerKey, SQN, Manifest) ->
-    get_object(LedgerKey, SQN, Manifest, false).
-
-get_object(LedgerKey, SQN, Manifest, ToIgnoreKeyChanges) ->
     JournalP = leveled_imanifest:find_entry(SQN, Manifest),
     InkerKey = leveled_codec:to_inkerkey(LedgerKey, SQN),
-    Obj = leveled_cdb:cdb_get(JournalP, InkerKey),
-    leveled_codec:from_inkerkv(Obj, ToIgnoreKeyChanges).
+    leveled_cdb:cdb_get(JournalP, InkerKey).
 
 
 -spec roll_active(pid(), leveled_imanifest:manifest(), 
