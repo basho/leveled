@@ -1112,7 +1112,7 @@ book_destroy(Pid) ->
     gen_server:call(Pid, destroy, infinity).
 
 
--spec book_hotbackup(pid()) -> {async, fun(() -> any())}.
+-spec book_hotbackup(pid()) -> {async, fun((file:name_all()) -> ok)}.
 %% @doc Backup the Bookie
 %% Return a function that will take a backup of a snapshot of the Journal.
 %% The function will be 1-arity, and can be passed the absolute folder name
