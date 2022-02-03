@@ -103,11 +103,11 @@ magichashperf_test() ->
             {K, X}
         end,
     KL = lists:map(KeyFun, lists:seq(1, 1000)),
-    {TimeMH, HL1} = timer:tc(lists, map, [fun(K) -> magic_hash(K) end, KL]),
+    {TimeMH, _HL1} = timer:tc(lists, map, [fun(K) -> magic_hash(K) end, KL]),
     io:format(user, "1000 keys magic hashed in ~w microseconds~n", [TimeMH]),
-    {TimePH, _Hl2} = timer:tc(lists, map, [fun(K) -> erlang:phash2(K) end, KL]),
+    {TimePH, _HL2} = timer:tc(lists, map, [fun(K) -> erlang:phash2(K) end, KL]),
     io:format(user, "1000 keys phash2 hashed in ~w microseconds~n", [TimePH]),
-    {TimeMH2, HL1} = timer:tc(lists, map, [fun(K) -> magic_hash(K) end, KL]),
+    {TimeMH2, _HL3} = timer:tc(lists, map, [fun(K) -> magic_hash(K) end, KL]),
     io:format(user, "1000 keys magic hashed in ~w microseconds~n", [TimeMH2]).
 
 
